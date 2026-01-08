@@ -1,0 +1,475 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <WebSocketsServer.h>
+#include <DNSServer.h>
+#include <Servo.h>
+#include <math.h>
+
+// =================== WIFI (AP MODE) ===================
+const char* AP_SSID = "ESP-360-MAP";
+const char* AP_PASS = "12345678";
+
+ESP8266WebServer server(80);
+WebSocketsServer ws(81);
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+
+Servo scanServo;
+
+// =================== PINS (NodeMCU) ===================
+const uint8_t SERVO_PIN = D1;
+
+const uint8_t TRIG1 = D2;
+const uint8_t ECHO1 = D5;
+
+const uint8_t TRIG2 = D6;
+const uint8_t ECHO2 = D7;
+
+// =================== SCAN PARAMS ===================
+volatile bool scanning = false;
+volatile bool loopMode = false;
+
+int angleMin = 0;
+int angleMax = 180;
+int angleStep = 2;
+
+int maxRangeCm = 400;              // başlangıç 400
+unsigned long settleMs = 45;
+unsigned long betweenPingsMs = 4;
+
+enum ScanState { MOVE_SERVO, MEASURE_SEND };
+ScanState scanState = MOVE_SERVO;
+
+int currentAngle = 0;
+unsigned long nextActionAt = 0;
+
+// =================== HTML ===================
+const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html><html lang="tr">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ESP8266 360° 2D Harita</title>
+<style>
+  body{font-family:system-ui,Arial;margin:16px;background:#0b0f14;color:#e8eef6}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start}
+  button,input{padding:10px 12px;border-radius:10px;border:1px solid #263244;background:#121a24;color:#e8eef6}
+  button{cursor:pointer}
+  button:hover{background:#162233}
+  .card{border:1px solid #263244;border-radius:14px;padding:12px;background:#0f1620}
+  canvas{border:1px solid #263244;border-radius:14px;background:#0b0f14}
+  label{opacity:.95}
+
+  /* ✅ Yazıları büyüttük */
+  .small{opacity:.85;font-size:14px}
+  #status{font-size:14px;opacity:.9}
+  #last{font-size:16px;font-weight:600;opacity:.97}
+</style>
+</head>
+<body>
+<h2>ESP8266 360° Ultrasonik 2D Harita</h2>
+
+<div class="row">
+  <div class="card" style="min-width:330px">
+    <div class="row">
+      <button id="btnStart">Başlat</button>
+      <button id="btnStop">Durdur</button>
+      <button id="btnClear">Temizle</button>
+    </div>
+
+    <div style="height:10px"></div>
+
+    <div class="row">
+      <label>Step (°):
+        <input id="step" type="number" min="1" max="10" value="2" style="width:90px">
+      </label>
+      <label>Max (cm):
+        <input id="maxcm" type="number" min="30" max="600" value="400" style="width:110px">
+      </label>
+    </div>
+
+    <div class="row" style="margin-top:10px">
+      <label>Servo settle (ms):
+        <input id="settle" type="number" min="10" max="250" value="45" style="width:140px">
+      </label>
+      <label><input id="loop" type="checkbox"> Sürekli</label>
+    </div>
+
+    <div class="row" style="margin-top:10px">
+      <label>Ofset1 (cm):
+        <input id="off1" type="number" step="0.5" min="0" max="20" value="3.0" style="width:110px">
+      </label>
+      <label>Ofset2 (cm):
+        <input id="off2" type="number" step="0.5" min="0" max="20" value="3.0" style="width:110px">
+      </label>
+    </div>
+
+    <div class="row" style="margin-top:10px">
+      <button id="btnApply">Ayarları Uygula</button>
+    </div>
+
+    <div class="small" id="status" style="margin-top:10px">Bağlantı bekleniyor…</div>
+    <div class="small" id="last" style="margin-top:6px"></div>
+
+    <div class="small" style="margin-top:10px;opacity:.75">
+       Düz duvar yay gibi görünür ise ofseti ayarlayın.
+    </div>
+  </div>
+
+  <div class="card">
+    <canvas id="cv" width="720" height="720"></canvas>
+    <div class="small" style="margin-top:8px">
+      Merkez = servo ekseni. Yeşil: ön, Sarı: arka (+180°)
+    </div>
+    <div class="small" style="margin-top:4px">
+      Ölçek (otomatik): <span id="scaleTxt"></span> px/cm
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  const cx = cv.width/2, cy = cv.height/2;
+
+  let ws;
+  let maxRangeCm = 400;
+  let scale = 1.0;
+
+  let off1 = 3.0;
+  let off2 = 3.0;
+
+  const statusEl = document.getElementById('status');
+  const lastEl = document.getElementById('last');
+  const scaleTxt = document.getElementById('scaleTxt');
+
+  function updateScale(){
+    const margin = 26;
+    const half = Math.min(cv.width, cv.height)/2;
+    scale = (half - margin) / maxRangeCm;
+    scaleTxt.textContent = scale.toFixed(3);
+  }
+
+  function ringStepFor(maxCm){
+    if(maxCm <= 150) return 25;
+    if(maxCm <= 300) return 50;
+    return 100;
+  }
+
+  function drawGrid(){
+    updateScale();
+    ctx.clearRect(0,0,cv.width,cv.height);
+
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "#2a3a4d";
+    ctx.globalAlpha = 0.55;
+
+    // eksenler
+    ctx.beginPath();
+    ctx.moveTo(0, cy); ctx.lineTo(cv.width, cy);
+    ctx.moveTo(cx, 0); ctx.lineTo(cx, cv.height);
+    ctx.stroke();
+
+    // daireler + yazılar
+    const step = ringStepFor(maxRangeCm);
+    ctx.globalAlpha = 0.30;
+    for(let r=step; r<=maxRangeCm; r+=step){
+      const rr = r*scale;
+      ctx.beginPath();
+      ctx.arc(cx, cy, rr, 0, Math.PI*2);
+      ctx.stroke();
+
+      // mesafe etiketi
+      ctx.globalAlpha = 0.85;
+      ctx.fillStyle = "#9fb3c8";
+      ctx.font = "12px system-ui";
+      const tx = cx + rr + 6;
+      const ty = cy - 4;
+      if(tx < cv.width - 10) ctx.fillText(`${r} cm`, tx, ty);
+      ctx.globalAlpha = 0.30;
+    }
+
+    // merkez
+    ctx.globalAlpha = 1.0;
+    ctx.fillStyle = "#e8eef6";
+    ctx.fillRect(cx-2, cy-2, 4, 4);
+  }
+
+  function plotPoint(thetaDeg, distCm, color, extraOffsetCm){
+    if(distCm === null || distCm === undefined) return;
+    const d = Number(distCm);
+    if(!isFinite(d) || d<=0) return;
+
+    const corrected = d + extraOffsetCm;
+    if(!isFinite(corrected) || corrected<=0 || corrected>maxRangeCm) return;
+
+    const th = thetaDeg * Math.PI/180;
+    const x = corrected * Math.cos(th);
+    const y = corrected * Math.sin(th);
+
+    const px = cx + x*scale;
+    const py = cy - y*scale;
+
+    ctx.fillStyle = color;
+    ctx.fillRect(px, py, 3, 3);
+  }
+
+  function connectWS(){
+    ws = new WebSocket(`ws://${location.hostname}:81/`);
+
+    ws.onopen = () => {
+      statusEl.textContent = 'WebSocket bağlı ✅';
+      drawGrid();
+    };
+
+    ws.onclose = () => {
+      statusEl.textContent = 'Bağlantı koptu. Yeniden bağlanıyor…';
+      setTimeout(connectWS, 700);
+    };
+
+    ws.onerror = () => statusEl.textContent = 'WebSocket hata ❌';
+
+    ws.onmessage = (ev) => {
+      try{
+        const msg = JSON.parse(ev.data);
+        if(msg.type === "scan"){
+          plotPoint(msg.a, msg.d1, "#00ff99", off1);
+          plotPoint(msg.a + 180, msg.d2, "#ffcc00", off2);
+          lastEl.textContent =
+            `A:${msg.a}°  d1:${(msg.d1==null?'null':msg.d1.toFixed(1))}cm  d2:${(msg.d2==null?'null':msg.d2.toFixed(1))}cm  | off1:${off1} off2:${off2}`;
+        } else if(msg.type === "clear"){
+          drawGrid();
+        } else if(msg.type === "cfg"){
+          if(Number.isFinite(msg.maxRangeCm)) {
+            maxRangeCm = msg.maxRangeCm;
+            document.getElementById('maxcm').value = String(maxRangeCm);
+          }
+          drawGrid();
+        } else if(msg.type === "done"){
+          statusEl.textContent = 'Tarama bitti ✅';
+        }
+      }catch(e){}
+    };
+  }
+
+  document.getElementById('btnStart').onclick = () => ws?.send("start");
+  document.getElementById('btnStop').onclick  = () => ws?.send("stop");
+  document.getElementById('btnClear').onclick = () => ws?.send("clear");
+
+  document.getElementById('btnApply').onclick = () => {
+    const step = parseInt(document.getElementById('step').value||"2",10);
+    const maxcm = parseInt(document.getElementById('maxcm').value||"400",10);
+    const settle = parseInt(document.getElementById('settle').value||"45",10);
+    const loop = document.getElementById('loop').checked ? 1 : 0;
+
+    off1 = Number(document.getElementById('off1').value || "0");
+    off2 = Number(document.getElementById('off2').value || "0");
+    if(!isFinite(off1)) off1 = 0;
+    if(!isFinite(off2)) off2 = 0;
+
+    maxRangeCm = maxcm;
+    drawGrid();
+
+    ws?.send(`step=${step}`);
+    ws?.send(`maxcm=${maxcm}`);
+    ws?.send(`settle=${settle}`);
+    ws?.send(`loop=${loop}`);
+  };
+
+  drawGrid();
+  connectWS();
+})();
+</script>
+</body></html>
+)HTML";
+
+// =================== ULTRASONIC (az blok) ===================
+static inline unsigned long pulseTimeoutUs() {
+  unsigned long t = (unsigned long)(maxRangeCm + 30) * 58UL; // 1cm ~58us
+  if (t < 6000) t = 6000;
+  if (t > 30000) t = 30000;
+  return t;
+}
+
+float readCmOnce(uint8_t trig, uint8_t echo) {
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+
+  yield();
+  unsigned long dur = pulseIn(echo, HIGH, pulseTimeoutUs());
+  if (dur == 0) return NAN;
+  return dur / 58.0f;
+}
+
+// 2 örnek al, min seç
+float readCmFast(uint8_t trig, uint8_t echo) {
+  float a = readCmOnce(trig, echo);
+  delay(1);
+  yield();
+  float b = readCmOnce(trig, echo);
+
+  if (!isfinite(a)) return b;
+  if (!isfinite(b)) return a;
+  return (a < b) ? a : b;
+}
+
+// =================== WS ===================
+void sendCfg() {
+  char buf[64];
+  snprintf(buf, sizeof(buf), "{\"type\":\"cfg\",\"maxRangeCm\":%d}", maxRangeCm);
+  ws.broadcastTXT(buf);
+}
+
+void wsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  if (type != WStype_TEXT) return;
+
+  String cmd = String((char*)payload).substring(0, length);
+  cmd.trim();
+
+  if (cmd == "start") {
+    scanning = true;
+    currentAngle = angleMin;
+    scanState = MOVE_SERVO;
+    nextActionAt = 0;
+    ws.broadcastTXT("{\"type\":\"clear\"}");
+    sendCfg();
+  } else if (cmd == "stop") {
+    scanning = false;
+  } else if (cmd == "clear") {
+    ws.broadcastTXT("{\"type\":\"clear\"}");
+  } else if (cmd.startsWith("step=")) {
+    int v = cmd.substring(5).toInt();
+    if (v >= 1 && v <= 10) angleStep = v;
+  } else if (cmd.startsWith("maxcm=")) {
+    int v = cmd.substring(6).toInt();
+    if (v >= 30 && v <= 600) maxRangeCm = v;
+    sendCfg();
+  } else if (cmd.startsWith("settle=")) {
+    int v = cmd.substring(7).toInt();
+    if (v >= 10 && v <= 250) settleMs = (unsigned long)v;
+  } else if (cmd.startsWith("loop=")) {
+    int v = cmd.substring(5).toInt();
+    loopMode = (v == 1);
+  }
+}
+
+// =================== HTTP / Captive ===================
+void sendIndex() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+}
+
+void sendRedirectRoot() {
+  server.sendHeader("Location", "/");
+  server.send(302, "text/plain", "");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG1, OUTPUT);
+  pinMode(ECHO1, INPUT);
+  pinMode(TRIG2, OUTPUT);
+  pinMode(ECHO2, INPUT);
+
+  digitalWrite(TRIG1, LOW);
+  digitalWrite(TRIG2, LOW);
+
+  scanServo.attach(SERVO_PIN);
+  scanServo.write(90);
+  delay(250);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  IPAddress apIP = WiFi.softAPIP();
+  Serial.print("AP IP: ");
+  Serial.println(apIP);
+
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  server.on("/", sendIndex);
+
+  // captive portal check endpointleri
+  server.on("/generate_204", sendRedirectRoot);
+  server.on("/gen_204", sendRedirectRoot);
+  server.on("/hotspot-detect.html", sendRedirectRoot);
+  server.on("/library/test/success.html", sendRedirectRoot);
+  server.on("/fwlink", sendRedirectRoot);
+  server.on("/ncsi.txt", sendRedirectRoot);
+  server.on("/connecttest.txt", sendRedirectRoot);
+
+  server.onNotFound(sendRedirectRoot);
+
+  server.begin();
+
+  ws.begin();
+  ws.onEvent(wsEvent);
+
+  sendCfg();
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  ws.loop();
+  server.handleClient();
+
+  if (!scanning) return;
+
+  unsigned long now = millis();
+  if (now < nextActionAt) return;
+
+  if (scanState == MOVE_SERVO) {
+    scanServo.write(currentAngle);
+    nextActionAt = now + settleMs;
+    scanState = MEASURE_SEND;
+    return;
+  }
+
+  float d1 = readCmFast(TRIG1, ECHO1);
+  delay(betweenPingsMs);
+  yield();
+  dnsServer.processNextRequest();
+  ws.loop();
+  server.handleClient();
+
+  float d2 = readCmFast(TRIG2, ECHO2);
+
+  if (isfinite(d1) && d1 > maxRangeCm) d1 = NAN;
+  if (isfinite(d2) && d2 > maxRangeCm) d2 = NAN;
+
+  char msg[96];
+  if (isfinite(d1) && isfinite(d2)) {
+    snprintf(msg, sizeof(msg), "{\"type\":\"scan\",\"a\":%d,\"d1\":%.1f,\"d2\":%.1f}", currentAngle, d1, d2);
+  } else if (isfinite(d1) && !isfinite(d2)) {
+    snprintf(msg, sizeof(msg), "{\"type\":\"scan\",\"a\":%d,\"d1\":%.1f,\"d2\":null}", currentAngle, d1);
+  } else if (!isfinite(d1) && isfinite(d2)) {
+    snprintf(msg, sizeof(msg), "{\"type\":\"scan\",\"a\":%d,\"d1\":null,\"d2\":%.1f}", currentAngle, d2);
+  } else {
+    snprintf(msg, sizeof(msg), "{\"type\":\"scan\",\"a\":%d,\"d1\":null,\"d2\":null}", currentAngle);
+  }
+
+  ws.broadcastTXT(msg);
+
+  currentAngle += angleStep;
+
+  if (currentAngle > angleMax) {
+    ws.broadcastTXT("{\"type\":\"done\"}");
+    if (loopMode) {
+      currentAngle = angleMin;
+      nextActionAt = now + 200;
+      scanState = MOVE_SERVO;
+    } else {
+      scanning = false;
+    }
+    return;
+  }
+
+  scanState = MOVE_SERVO;
+  nextActionAt = now + 2;
+}
